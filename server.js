@@ -2,25 +2,23 @@
 import "dotenv/config";
 import express from "express";
 import Parser from "rss-parser";
-import Database from "better-sqlite3";
+import pg from "pg";
 import { gerarNoticia } from "./ia.js";
-
-import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-// Configuração das pastas
+const { Pool } = pg;
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const pastaDatabase = path.join(__dirname, "database");
-
-fs.mkdirSync(pastaDatabase, { recursive: true });
-
-// Banco de dados
-const db = new Database(
-  path.join(pastaDatabase, "noticias.db")
-);
+// Conexão com o banco Neon
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false
+  }
+});
 
 const app = express();
 const parser = new Parser();
@@ -28,28 +26,23 @@ const parser = new Parser();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 
-// Criação da tabela
-db.exec(`
-  CREATE TABLE IF NOT EXISTS noticias (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    titulo TEXT,
-    subtitulo TEXT,
-    conteudo TEXT,
-    imagem TEXT,
-    fonte TEXT,
-    link TEXT UNIQUE,
-    status TEXT DEFAULT 'revisar',
-    data_criacao DATETIME DEFAULT CURRENT_TIMESTAMP
-  )
-`);
+// Cria a tabela no banco, caso ainda não exista
+async function criarTabela() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS noticias (
+      id SERIAL PRIMARY KEY,
+      titulo TEXT,
+      subtitulo TEXT,
+      conteudo TEXT,
+      imagem TEXT,
+      fonte TEXT,
+      link TEXT UNIQUE,
+      status TEXT DEFAULT 'revisar',
+      data_criacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
 
-// Garante que a coluna imagem exista em bancos antigos
-try {
-  db.exec("ALTER TABLE noticias ADD COLUMN imagem TEXT");
-} catch (erro) {
-  if (!erro.message.includes("duplicate column name")) {
-    throw erro;
-  }
+  console.log("Banco de dados preparado!");
 }
 
 // Fontes de notícias
@@ -79,7 +72,6 @@ async function obterImagem(item) {
   );
 
   if (encontrada) return encontrada;
-
   if (!item.link) return null;
 
   try {
@@ -92,7 +84,6 @@ async function obterImagem(item) {
     if (!resposta.ok) return null;
 
     const html = await resposta.text();
-
     const tagsMeta = html.match(/<meta\b[^>]*>/gi) || [];
 
     for (const tag of tagsMeta) {
@@ -113,53 +104,9 @@ async function obterImagem(item) {
     }
 
     return null;
-
   } catch (erro) {
-    console.log(
-      "Não foi possível encontrar imagem:",
-      item.link,
-      erro.message
-    );
-
+    console.log("Erro ao buscar imagem:", erro.message);
     return null;
-  }
-}
-
-// Atualiza imagens das notícias antigas
-async function preencherImagensAntigas() {
-  const noticias = db.prepare(
-    "SELECT id, link FROM noticias WHERE imagem IS NULL"
-  ).all();
-
-  console.log(
-    "Procurando imagens para",
-    noticias.length,
-    "notícias antigas..."
-  );
-
-  for (const noticia of noticias) {
-    try {
-      const imagem = await obterImagem({
-        link: noticia.link
-      });
-
-      if (imagem) {
-        db.prepare(
-          "UPDATE noticias SET imagem = ? WHERE id = ?"
-        ).run(imagem, noticia.id);
-
-        console.log("Imagem adicionada:", noticia.id);
-      } else {
-        console.log("Imagem não encontrada:", noticia.id);
-      }
-
-    } catch (erro) {
-      console.error(
-        "Erro ao buscar imagem:",
-        noticia.link,
-        erro.message
-      );
-    }
   }
 }
 
@@ -174,11 +121,12 @@ async function atualizarNoticias() {
       for (const item of feed.items.slice(0, 5)) {
         if (!item.link || !item.title) continue;
 
-        const existe = db.prepare(
-          "SELECT id FROM noticias WHERE link = ?"
-        ).get(item.link);
+        const existe = await pool.query(
+          "SELECT id FROM noticias WHERE link = $1",
+          [item.link]
+        );
 
-        if (existe) continue;
+        if (existe.rows.length > 0) continue;
 
         const textoOriginal =
           item.contentSnippet ||
@@ -197,53 +145,71 @@ async function atualizarNoticias() {
           link: item.link
         });
 
-        db.prepare(`
-          INSERT OR IGNORE INTO noticias
+        await pool.query(
+          `INSERT INTO noticias
           (titulo, conteudo, imagem, fonte, link, status)
-          VALUES (?, ?, ?, ?, ?, 'revisar')
-        `).run(
-          item.title,
-          materia,
-          imagem,
-          fonte.nome,
-          item.link
+          VALUES ($1, $2, $3, $4, $5, 'revisar')
+          ON CONFLICT (link) DO NOTHING`,
+          [
+            item.title,
+            materia,
+            imagem,
+            fonte.nome,
+            item.link
+          ]
         );
 
-        console.log(
-          "Notícia salva para revisão:",
-          item.title
-        );
+        console.log("Notícia salva para revisão:", item.title);
       }
-
     } catch (erro) {
-      console.error(
-        "Erro na fonte",
-        fonte.nome,
-        erro.message
-      );
+      console.error("Erro na fonte", fonte.nome, erro.message);
     }
   }
 }
 
 // API de notícias
-app.get("/api/noticias", (req, res) => {
-  const noticias = db.prepare(
-    "SELECT * FROM noticias ORDER BY data_criacao DESC"
-  ).all();
+app.get("/api/noticias", async (req, res) => {
+  try {
+    const resultado = await pool.query(
+      "SELECT * FROM noticias ORDER BY data_criacao DESC"
+    );
 
-  res.json(noticias);
+    res.json(resultado.rows);
+  } catch (erro) {
+    console.error("Erro ao buscar notícias:", erro.message);
+
+    res.status(500).json({
+      erro: "Não foi possível carregar as notícias."
+    });
+  }
 });
 
 // Inicialização do servidor
-app.listen(process.env.PORT || 3000, async () => {
-  console.log("Portal funcionando!");
+async function iniciarServidor() {
+  try {
+    await criarTabela();
 
-  await preencherImagensAntigas();
+    const porta = process.env.PORT || 3000;
 
-  await atualizarNoticias();
-});
+    app.listen(porta, () => {
+      console.log("Portal News funcionando na porta", porta);
+    });
 
-// Atualização automática a cada 30 minutos
-setInterval(() => {
-  atualizarNoticias();
-}, 30 * 60 * 1000);
+    atualizarNoticias().catch(erro => {
+      console.error("Erro na atualização:", erro.message);
+    });
+
+    // Atualização automática a cada 30 minutos
+    setInterval(() => {
+      atualizarNoticias().catch(erro => {
+        console.error("Erro na atualização automática:", erro.message);
+      });
+    }, 30 * 60 * 1000);
+
+  } catch (erro) {
+    console.error("Erro ao iniciar o Portal News:", erro.message);
+    process.exit(1);
+  }
+}
+
+iniciarServidor();
